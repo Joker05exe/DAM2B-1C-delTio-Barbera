@@ -1,24 +1,30 @@
 package cat.institut.dam.contactes
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.widget.doAfterTextChanged
+import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 
 /**
  * MainActivity — la llista de contactes.
  *
- * Aquesta classe és l'esquelet de la pràctica: la interfície ja està
- * connectada, però la part de les dades (carregar, filtrar i obrir el
- * detall) la has de fer tu. Busca els TODO.
+ * Carrega els contactes des de la xarxa (o des de la còpia local si no hi ha
+ * connexió), permet filtrar-los, marcar favorits, obrir el detall i mostrar
+ * una notificació un cop carregats.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -33,6 +39,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var txtBuit: TextView
     private lateinit var txtAvis: TextView
     private lateinit var rvContactes: RecyclerView
+    private lateinit var adapter: ContacteAdapter
+
+    private val handlerPrincipal = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -46,40 +55,110 @@ class MainActivity : AppCompatActivity() {
         txtAvis = findViewById(R.id.txtAvis)
         rvContactes = findViewById(R.id.rvContactes)
 
-        // TODO 1: crea el teu ContacteAdapter, assigna'l al RecyclerView i
-        //         posa-li un LinearLayoutManager.
-        //
-        //         rvContactes.layoutManager = LinearLayoutManager(this)
-        //         rvContactes.adapter = adapter
+        adapter = ContacteAdapter(
+            onContacteClick = { contacte ->
+                val intent = Intent(this, ContacteDetallActivity::class.java).apply {
+                    putExtra(ContacteDetallActivity.EXTRA_ID, contacte.id)
+                }
+                startActivity(intent)
+            },
+            onFavoritClick = { contacte ->
+                ContactesRepository.alternaFavorit(contacte.id)
+            }
+        )
+        rvContactes.layoutManager = LinearLayoutManager(this)
+        rvContactes.adapter = adapter
 
-        // TODO 2: el cercador ha de filtrar la llista a cada tecla.
-        //
-        //         etCerca.doAfterTextChanged { text -> ... }
+        etCerca.doAfterTextChanged {
+            mostraLlista()
+        }
 
-        // TODO 3: el botó ha de tornar a carregar els contactes.
-        //
-        //         btnActualitza.setOnClickListener { ... }
+        btnActualitza.setOnClickListener {
+            carrega()
+        }
 
-        // TODO 4: el mètode demanaPermisNotificacions() ja està implementat.
-        //         Crida'l quan hagis carregat les dades (TODO 5), abans de
-        //         mostrar la notificació, i gestiona la denegació (TODO 6).
         carrega()
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (ContactesRepository.llista.isNotEmpty()) {
+            mostraLlista()
+        }
+    }
+
+    private fun mostraLlista() {
+        val consulta = etCerca.text.toString()
+        val filtrats = ContactesRepository.cerca(consulta)
+        adapter.actualitza(filtrats)
+
+        if (filtrats.isEmpty()) {
+            txtBuit.setText(
+                if (consulta.isBlank()) R.string.txt_buit else R.string.txt_buit_cerca
+            )
+            txtBuit.visibility = View.VISIBLE
+            rvContactes.visibility = View.GONE
+        } else {
+            txtBuit.visibility = View.GONE
+            rvContactes.visibility = View.VISIBLE
+        }
+    }
+
     /**
-     * TODO 5: carrega els contactes.
-     *
-     * La petició HTTP no es pot fer al fil principal: has de fer-la en un
-     * fil de segon pla i tornar al fil principal amb un Handler.
-     *
-     * Si no hi ha xarxa, carrega els contactes del fitxer local
-     * `assets/contactes.json` i avisa l'usuari amb `txtAvis`.
-     *
-     * Quan la llista s'hagi carregat correctament, crida
-     * `demanaPermisNotificacions()` abans de mostrar la notificació.
+     * Carrega els contactes en un fil de segon pla i actualitza la interfície
+     * al fil principal. Si no hi ha xarxa, recorre a `assets/contactes.json`.
      */
     private fun carrega() {
-        // TODO: implementa la càrrega de dades
+        pbCarga.visibility = View.VISIBLE
+        btnActualitza.isEnabled = false
+        txtAvis.visibility = View.GONE
+
+        Thread {
+            var usantLocal = false
+            val resultat = try {
+                ContactesService.desDeXarxa()
+            } catch (_: Exception) {
+                usantLocal = true
+                try {
+                    ContactesService.desDeRecurs(this)
+                } catch (_: Exception) {
+                    null
+                }
+            }
+
+            handlerPrincipal.post {
+                if (isFinishing || isDestroyed) return@post
+                pbCarga.visibility = View.GONE
+                btnActualitza.isEnabled = true
+
+                if (resultat == null) {
+                    Toast.makeText(this, R.string.error_carrega, Toast.LENGTH_LONG).show()
+                    mostraLlista()
+                    return@post
+                }
+
+                ContactesRepository.actualitza(resultat)
+                if (usantLocal) {
+                    txtAvis.setText(R.string.avis_dades_locals)
+                    txtAvis.visibility = View.VISIBLE
+                }
+                mostraLlista()
+
+                if (tePermisNotificacions()) {
+                    Notificacions.mostraContactesCarregats(this, resultat.size)
+                } else {
+                    demanaPermisNotificacions()
+                }
+            }
+        }.start()
+    }
+
+    private fun tePermisNotificacions(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
     }
 
     /**
@@ -98,7 +177,7 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Resposta de l'usuari a la petició de permís: si el denega, avisa'l amb
-     * un Toast.
+     * un Toast; si el concedeix, mostra la notificació.
      */
     override fun onRequestPermissionsResult(
         requestCode: Int,
@@ -109,8 +188,10 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == REQUEST_NOTIFICACIONS) {
             val concedit = grantResults.isNotEmpty() &&
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
-            if (!concedit) {
-                // TODO 6: avisa l'usuari que no es mostraran notificacions
+            if (concedit) {
+                Notificacions.mostraContactesCarregats(this, ContactesRepository.llista.size)
+            } else {
+                Toast.makeText(this, R.string.permis_denegada, Toast.LENGTH_LONG).show()
             }
         }
     }
